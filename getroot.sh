@@ -1,0 +1,358 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPLv3 or later
+# Copyright (C) 2026 LongQT-sea <long025733@gmail.com>
+
+# getroot - rootfs downloader written in POSIX shell
+# A companion tool for nspawn.sh
+
+#set -x # debug flag
+set -eu
+
+SERVER="https://images.linuxcontainers.org"
+TMP_DIR="/tmp"
+DNS="1.1.1.1"
+PASSWORD="1"
+
+RED=$(printf '\033[31m')
+GREEN=$(printf '\033[32m')
+YELLOW=$(printf '\033[33m')
+NC=$(printf '\033[0m')
+
+if [ -n "${ANDROID_ROOT:-}" ] && [ -n "${ANDROID_DATA:-}" ]; then
+    TMP_DIR="/mnt/getroot"
+    chroot() { toybox chroot "$@"; }
+    if [ "$(command -v tar)" = "/system/bin/tar" ]; then
+        tar() { busybox tar "$@"; }
+    fi
+fi
+
+die()     { printf '%sError: %s%s\n' "$RED"    "$*" "$NC" >&2; exit 1; }
+info()    { printf '%s==> %s%s\n'    "$GREEN"  "$*" "$NC" >&2; }
+warn() { printf '%sWarning: %s%s\n' "$YELLOW" "$*" "$NC" >&2; }
+verbose() { [ "${VERBOSE:-0}" -eq 1 ] || return 0; printf '%s  -> %s%s\n' "$YELLOW" "$*" "$NC" >&2; }
+
+[ "$(id -u)" -eq 0 ] || die "Must be root"
+
+[ "$(df -Pk "." | awk 'NR==2{print $4}')" -ge 1048576 ] \
+    || warn "Low disk space (< 1GB free)"
+
+if command -v curl >/dev/null 2>&1; then
+    fetch_cmd() { curl -fL --progress-bar "$1" -o "$2"; }
+elif command -v wget >/dev/null 2>&1; then
+    fetch_cmd() { wget -q --no-check-certificate "$1" -O "$2"; }
+elif command -v busybox >/dev/null 2>&1 && busybox wget --help >/dev/null 2>&1; then
+    fetch_cmd() { busybox wget -q --no-check-certificate "$1" -O "$2"; }
+else
+    die "Need curl or wget command"
+fi
+
+tar --help 2>&1 | grep -wq -- xz || die "Need tar command"
+
+usage() {
+    cat <<EOF
+
+            getroot
+
+Get rootfs from linuxcontainers.org
+A companion tool for nspawn.sh
+
+Usage: getroot [Options] [Distro:Release]
+
+Examples:
+  getroot debian:13
+  getroot ubuntu:24 -o myubuntu_24
+  getroot -d alpine -r edge
+  getroot --list
+  getroot --search debian
+
+Options:
+  -d, --distro DISTRO     Distribution name
+  -r, --release RELEASE   Release version (default: current release)
+  -a, --arch ARCH         Architecture (default: auto-detect)
+  -o, --output DIR        Output directory (default: current directory)
+  -l, --list              List available images
+  -s, --search DISTRO     Search releases for distro
+  -v, --verbose           Verbose output
+  -h, --help              Show this help
+
+EOF
+    exit 0
+}
+
+detect_arch() {
+    if [ -n "${ARCH}" ]; then
+        return
+    fi
+    uname_arch=$(uname -m)
+    case "$uname_arch" in
+        aarch64|arm64) ARCH="arm64" ;;
+        x86_64|amd64) ARCH="amd64" ;;
+        armv7*|armv8l) ARCH="armhf" ;;
+        riscv64) ARCH="riscv64" ;;
+        *) ARCH="$uname_arch" ;;
+    esac
+    verbose "Detected architecture: $ARCH"
+}
+
+parse_image() {
+    image="$1"
+
+    case "$image" in
+        *:*)
+            DISTRO="${image%%:*}"
+            RELEASE="${image#*:}"
+            ;;
+        *)
+            DISTRO="$image"
+            RELEASE=""
+            ;;
+    esac
+}
+
+resolve_release() {
+    # If no release specified, use current release for known distros
+    if [ -z "$RELEASE" ]; then
+        case "$DISTRO" in
+            almalinux)    RELEASE="10" ;;
+            alpine)       RELEASE="edge" ;;
+            alt)          RELEASE="Sisyphus" ;;
+            amazonlinux)  RELEASE="2" ;;
+            archlinux)    RELEASE="current" ;;
+            busybox)      RELEASE="1.36.1" ;;
+            centos)       RELEASE="10-Stream" ;;
+            debian)       RELEASE="trixie" ;;
+            devuan)       RELEASE="excalibur" ;;
+            fedora)       RELEASE="43" ;;
+            gentoo)       RELEASE="current" ;;
+            kali)         RELEASE="current" ;;
+            nixos)        RELEASE="unstable" ;;
+            openeuler)    RELEASE="25.09" ;;
+            opensuse)     RELEASE="tumbleweed" ;;
+            openwrt)      RELEASE="snapshot" ;;
+            oracle)       RELEASE="9" ;;
+            rockylinux)   RELEASE="10" ;;
+            ubuntu)       RELEASE="questing" ;;
+            voidlinux)    RELEASE="current" ;;
+        esac
+        return
+    fi
+
+    # Yes, I memorize distro releases by number :(
+    case "${DISTRO}:${RELEASE}" in
+        debian:11) RELEASE="bullseye" ;;
+        debian:12) RELEASE="bookworm" ;;
+        debian:13) RELEASE="trixie" ;;
+        debian:14) RELEASE="forky" ;;
+
+        ubuntu:22.04) RELEASE="jammy" ;;
+        ubuntu:24.04) RELEASE="noble" ;;
+        ubuntu:25.10) RELEASE="questing" ;;
+        ubuntu:22) RELEASE="jammy" ;;
+        ubuntu:24) RELEASE="noble" ;;
+        ubuntu:25) RELEASE="questing" ;;
+    esac
+}
+
+fetch_index() {
+    index_file="${TMP_DIR}/index-system"
+    mkdir -p "$TMP_DIR"
+
+    info "Fetching image index from images.linuxcontainers.org ..." >&2
+    if ! fetch_cmd "${SERVER}/meta/1.0/index-system" "$index_file"; then
+        die "Failed to download image index"
+    fi
+
+    verbose "Index downloaded to $index_file"
+}
+
+list_images() {
+    fetch_index
+    index_file="${TMP_DIR}/index-system"
+
+    echo ""
+    echo "Available images for ${ARCH}:"
+    echo "----------------------------------------"
+    printf "%-15s %-15s %-10s\n" "DISTRO" "RELEASE" "VARIANT"
+    echo "----------------------------------------"
+
+    while IFS=';' read -r dist rel arch var build path; do
+        [ "$arch" = "$ARCH" ] || continue
+        [ "$var" = "cloud" ] && continue
+        [ -z "$path" ] && continue
+
+        printf "%-15s %-15s %-10s\n" "$dist" "$rel" "$var"
+    done < "$index_file" | sort -u
+
+    echo "----------------------------------------"
+}
+
+search_distro() {
+    search_dist="$1"
+    fetch_index
+    index_file="${TMP_DIR}/index-system"
+
+    echo ""
+    echo "Available releases for ${search_dist} (${ARCH}):"
+    echo "----------------------------------------"
+    printf "%-15s %-10s\n" "RELEASE" "VARIANT"
+    echo "----------------------------------------"
+
+    found=0
+    {
+        while IFS=';' read -r dist rel arch var build path; do
+            [ "$dist" = "$search_dist" ] || continue
+            [ "$arch" = "$ARCH" ] || continue
+            [ "$var" = "cloud" ] && continue
+            [ -z "$path" ] && continue
+
+            printf "%-15s %-10s\n" "$rel" "$var"
+            found=1
+        done
+
+        if [ "$found" -eq 0 ]; then
+            echo "No images found for $search_dist"
+        fi
+    } < "$index_file" | sort -u
+
+    echo "----------------------------------------"
+}
+
+find_image_url() {
+    fetch_index
+    index_file="${TMP_DIR}/index-system"
+
+    verbose "Searching for: $DISTRO / $RELEASE / $ARCH"
+
+    found_path=""
+    while IFS=';' read -r dist rel arch var build path; do
+        [ "$dist" = "$DISTRO" ] || continue
+        [ "$arch" = "$ARCH" ] || continue
+        [ "$var" = "cloud" ] && continue
+        [ -z "$path" ] && continue
+
+        # Match release if specified, otherwise take first match
+        if [ -n "$RELEASE" ]; then
+            [ "$rel" = "$RELEASE" ] || continue
+        fi
+
+        found_path="$path"
+        RELEASE="$rel"
+        break
+    done < "$index_file"
+
+    if [ -z "$found_path" ]; then
+        die "No image found for ${DISTRO}:${RELEASE} (${ARCH})"
+    fi
+
+    echo "${SERVER}${found_path}"
+}
+
+download_rootfs() {
+    base_url="$1"
+    rootfs_url="${base_url}rootfs.tar.xz"
+
+    if [ -z "$OUTPUT" ]; then
+        OUTPUT="${DISTRO}_${RELEASE}"
+    fi
+
+    if [ -d "$OUTPUT" ]; then
+        printf "Directory %s already exists. Overwrite? [y/N] " "$OUTPUT" >&2
+        read -r answer
+        case "$answer" in
+            [Yy]*) rm -rf -- "$OUTPUT" ;;
+            *) die "Aborted" ;;
+        esac
+    fi
+
+    info "Downloading ${DISTRO}:${RELEASE} for ${ARCH}..."
+    fetch_cmd "$rootfs_url" "${TMP_DIR}/rootfs.tar.xz"
+
+    info "Extracting rootfs to ${OUTPUT}..."
+    mkdir -p "$OUTPUT"
+
+    tar_opts="-xf" && [ "$VERBOSE" -eq 1 ] && tar_opts="-xvf"
+    if ! tar $tar_opts "${TMP_DIR}/rootfs.tar.xz" -C "$OUTPUT"; then
+        rm -rf -- "$TMP_DIR" "$OUTPUT"
+        die "Failed to extract rootfs"
+    fi
+
+    if [ -n "$DNS" ]; then
+        mv -- "${OUTPUT}/etc/resolv.conf" "${OUTPUT}/etc/resolv.conf.bk" || true
+        echo "nameserver $DNS" > "${OUTPUT}/etc/resolv.conf"
+    fi
+
+    chroot "${OUTPUT}" /usr/bin/env -i PATH=/usr/bin:/usr/sbin:/sbin:/bin sh -c \
+        "echo 'root:$PASSWORD' | chpasswd >/dev/null 2>&1" || true
+
+    info "root password has been set to '1'"
+
+    rm -rf -- "$TMP_DIR"
+
+    info "Done! Rootfs ready at: ${OUTPUT}"
+}
+
+DISTRO=""
+RELEASE=""
+ARCH=""
+OUTPUT=""
+VERBOSE=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+        -l|--list)
+            detect_arch
+            list_images
+            exit 0
+            ;;
+        -s|--search)
+            [ $# -lt 2 ] && die "--search requires DISTRO argument"
+            detect_arch
+            search_distro "$2"
+            exit 0
+            ;;
+        -d|--distro)
+            [ $# -lt 2 ] && die "--distro requires DISTRO argument"
+            # Parse in case it contains colon
+            parse_image "$2"
+            shift 2
+            ;;
+        -r|--release)
+            [ $# -lt 2 ] && die "--release requires RELEASE argument"
+            RELEASE="$2"
+            shift 2
+            ;;
+        -a|--arch)
+            [ $# -lt 2 ] && die "--arch requires ARCH argument"
+            ARCH="$2"
+            shift 2
+            ;;
+        -o|--output)
+            [ $# -lt 2 ] && die "--output requires DIR argument"
+            OUTPUT="$2"
+            shift 2
+            ;;
+        -*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            parse_image "$1"
+            shift
+            ;;
+    esac
+done
+
+# Main execution
+detect_arch
+resolve_release
+
+[ -z "$DISTRO" ] && usage
+
+url=$(find_image_url)
+download_rootfs "$url"
