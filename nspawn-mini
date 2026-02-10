@@ -1,0 +1,232 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPLv3 or later
+# Copyright (C) 2026 LongQT-sea <long025733@gmail.com>
+#
+# nspawn - chroot on steroid
+#
+# A ~200-line POSIX shell script that implements minimal Linux
+# container using namespaces, bind mounts, and pivot_root.
+#
+# No daemons. No D-Bus. No dependencies beyond a POSIX shell,
+# a few coreutils or busybox, and a kernel >= 4.19.
+
+#set -x # debug flag
+set -eu
+
+RED=$(printf '\033[31m')
+GREEN=$(printf '\033[32m')
+NC=$(printf '\033[0m')
+
+die() { printf '%sError: %s%s\n' "$RED" "$*" "$NC" >&2; exit 1; }
+info() { printf '%s==> %s%s\n' "$GREEN" "$*" "$NC" >&2; }
+
+# Android quirks
+if [ -n "${ANDROID_ROOT:-}" ] && [ -n "${ANDROID_DATA:-}" ]; then
+    ANDROID=1
+    _PATH="/usr/sbin:/usr/bin:/sbin:/bin:/system/bin"
+
+    # Yes toybox does have pivot_root
+    pivot_root() { toybox pivot_root "$@"; }
+
+    # toybox mount is missing required features
+    if command -v busybox >/dev/null 2>&1; then
+        mount() { busybox mount "$@"; }
+    elif [ "$(command -v mount)" = "/system/bin/mount" ]; then
+        die "toybox mount is not supported"
+    fi
+fi
+
+if command -v unshare >/dev/null; then
+    unshare() { command unshare "$@"; }
+elif command -v busybox && busybox unshare --help >/dev/null 2>&1; then
+    unshare() { busybox unshare "$@"; }
+else
+    die "Need unshare command"
+fi
+
+# === Phase 2 ===
+if [ "${PHASE2:-}" = "1" ]; then
+    # Run inside a Linux namespace (at least a mount namespace)
+    ROOTFS="$1"
+    shift
+
+    if [ $# -eq 0 ]; then
+        if [ -x "$ROOTFS/bin/bash" ]; then
+            set -- /bin/bash -il
+        else
+            set -- /bin/sh -il
+        fi
+    fi
+
+    if [ "${UTS_NS:-}" = "1" ]; then
+        echo "$HOSTNAME" > /proc/sys/kernel/hostname
+        echo "$HOSTNAME" > "$ROOTFS/etc/hostname"
+        grep -q "127.0.1.1.*$HOSTNAME" "$ROOTFS/etc/hosts" 2>/dev/null || \
+            echo "127.0.1.1	$HOSTNAME" >> "$ROOTFS/etc/hosts"
+    fi
+
+    mount -o bind,private "$ROOTFS" "$ROOTFS"
+
+    # Android quirks
+    mount -o remount,suid,dev "$ROOTFS"
+
+    # This makes the `ip rule` command inside the container show human-readable rule name when using host network
+    # https://android.googlesource.com/platform/system/netd/+/refs/heads/main/server/RouteController.h#105
+    if [ "${ANDROID:-}" = "1" ]; then
+        mkdir -p "$ROOTFS/etc/iproute2"
+        touch "$ROOTFS/etc/iproute2/rt_tables"
+        mount -o bind /data/misc/net/rt_tables "$ROOTFS/etc/iproute2/rt_tables"
+    fi
+
+    # Expose Android user 0 internal storage to the container
+    if [ "${ANDROID:-}" = "1" ] && [ -d /data/media/0 ]; then
+        mkdir -p "$ROOTFS/mnt/storage"
+        mount -o bind /data/media/0 "$ROOTFS/mnt/storage"
+    fi
+
+    mount -t proc -o nosuid,nodev,noexec proc "$ROOTFS/proc"
+    mount -t sysfs -o ro,nosuid,nodev,noexec sysfs "$ROOTFS/sys"
+    mount -t cgroup2 -o nosuid,noexec,nodev cgroup2 "$ROOTFS/sys/fs/cgroup"
+    mount -t tmpfs -o nosuid,nodev,noatime tmpfs "$ROOTFS/tmp"
+    mount -t tmpfs -o rw,nosuid,nodev,mode=755 tmpfs "$ROOTFS/run"
+    mount -t tmpfs -o nosuid,mode=755,strictatime,size=65536k tmpfs "$ROOTFS/dev"
+
+    # Minimal /dev setup; a classic bind mount of /dev is usually overkill
+    mkdir -p "$ROOTFS/dev/pts" "$ROOTFS/dev/shm" "$ROOTFS/dev/net" "$ROOTFS/dev/mqueue"
+    mount -t tmpfs -o nosuid,noexec,nodev,mode=1777,size=524288k shm "$ROOTFS/dev/shm"
+    mount -t mqueue -o rw,nosuid,nodev,noexec,relatime mqueue "$ROOTFS/dev/mqueue"
+
+    mknod -m 666 "$ROOTFS/dev/null" c 1 3
+    mknod -m 666 "$ROOTFS/dev/zero" c 1 5
+    mknod -m 666 "$ROOTFS/dev/full" c 1 7
+    mknod -m 666 "$ROOTFS/dev/tty" c 5 0
+    mknod -m 666 "$ROOTFS/dev/fuse" c 10 229
+    mknod -m 666 "$ROOTFS/dev/random" c 1 8
+    mknod -m 666 "$ROOTFS/dev/urandom" c 1 9
+    mknod -m 620 "$ROOTFS/dev/console" c 136 0
+    mknod -m 666 "$ROOTFS/dev/net/tun" c 10 200
+
+    ln -sf pts/ptmx "$ROOTFS/dev/ptmx"
+    ln -sf /proc/self/fd "$ROOTFS/dev/fd"
+    ln -sf /proc/self/fd/0 "$ROOTFS/dev/stdin"
+    ln -sf /proc/self/fd/1 "$ROOTFS/dev/stdout"
+    ln -sf /proc/self/fd/2 "$ROOTFS/dev/stderr"
+
+#    mount -t devpts -o nosuid,noexec,newinstance,mode=620,ptmxmode=0666 devpts "$ROOTFS/dev/pts"
+    mount -o bind /dev/pts "$ROOTFS/dev/pts"
+    mount -o remount,ptmxmode=0666,mode=620 "$ROOTFS/dev/pts"
+
+    # Try hook pty -> /dev/console for console login, but that didn't work out, by masking console-getty
+    # at least we still have a console log with job control (Ctrl-C to shutdown systemd)
+    if [ -t 0 ]; then
+        mount -o bind "$(tty)" "$ROOTFS/dev/console"
+    fi
+
+    if [ -f "$ROOTFS/usr/lib/systemd/systemd" ]; then
+        ln -sf /dev/null "$ROOTFS/etc/systemd/system/console-getty.service"
+        ln -sf /dev/null "$ROOTFS/etc/systemd/system/systemd-firstboot.service"
+        ln -sf /dev/null "$ROOTFS/etc/systemd/system/systemd-networkd-wait-online.service"
+    fi
+
+    # Android quirks
+    if [ "${ANDROID:-}" = "1" ]; then
+        echo "0 2147483647" > "$ROOTFS/proc/sys/net/ipv4/ping_group_range"
+        export PATH="$_PATH" && unset LD_PRELOAD
+    fi
+
+    # Ubuntu 25 Rust quirk
+    export PATH="$PATH:/lib/cargo/bin/coreutils"
+
+    mkdir -p "$ROOTFS/old_root" && cd "$ROOTFS"
+    pivot_root . old_root && cd /
+
+    # On Termux with tsu, chroot immediately after pivot_root is required
+    exec chroot . env -i \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        HOME=/root \
+        TERM=xterm-256color \
+        /bin/sh -c 'cd; umount -l /old_root && rmdir /old_root; exec "$@"' -- "$@"
+fi
+
+# === Phase 1 ===
+usage() {
+    cat <<EOF
+
+Usage: nspawn [OPTIONS] <rootfs> [command...]
+
+Options:
+  -h, --help                  Show this help
+
+EOF
+    exit 0
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        -V|--version)
+            echo "nspawn version $VERSION"
+            exit 0
+            ;;
+        -*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ $# -eq 0 ]; then usage; fi
+
+ROOTFS="$1"
+shift
+
+[ -d "$ROOTFS" ] || die "Rootfs not found"
+
+[ "$(id -u)" -eq 0 ] || die "Must be root"
+
+# Require 2020+ Android devices
+kernel_version=$(uname -r)
+major=$(echo "$kernel_version" | cut -d. -f1)
+minor=$(echo "$kernel_version" | cut -d. -f2)
+if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 19 ]; }; then
+    die "Kernel version must be >= 4.19"
+fi
+
+ROOTFS=$(cd "$ROOTFS" && pwd -P)
+HOSTNAME=$(basename "$ROOTFS" | tr '_' '-')
+
+check_ns() { unshare "$1" true 2>/dev/null; }
+
+check_ns -p && PID_NS=1
+check_ns -i && IPC_NS=1
+check_ns -u && UTS_NS=1
+check_ns -m && MOUNT_NS=1
+
+if unshare --root / true 2>/dev/null; then
+    FULL_UNSHARE=1
+    check_ns -T && TIME_NS=1
+    check_ns -C && CGROUP_NS=1
+fi
+
+[ "${PID_NS:-}" = 1 ] && ARGS="${ARGS:-} -p -f"
+[ "${IPC_NS:-}" = 1 ] && ARGS="${ARGS:-} -i"
+[ "${UTS_NS:-}" = 1 ] && ARGS="${ARGS:-} -u"
+[ "${MOUNT_NS:-}" = 1 ] && ARGS="${ARGS:-} -m"
+
+if [ "${FULL_UNSHARE:-}" = 1 ]; then
+    ARGS="${ARGS:-} --kill-child"
+    [ "${TIME_NS:-}" = 1 ] && ARGS="${ARGS:-} -T"
+    [ "${CGROUP_NS:-}" = 1 ] && ARGS="${ARGS:-} -C"
+fi
+
+# Start phase 2
+PHASE2=1 export PHASE2 HOSTNAME UTS_NS
+if [ "${MOUNT_NS:-}" = "1" ]; then
+    exec unshare $ARGS -- "$0" "$ROOTFS" "$@"
+else
+    die "Kernel lacks mount namespace support"
+fi

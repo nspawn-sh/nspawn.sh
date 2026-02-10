@@ -83,9 +83,9 @@
 # If you boot systemd init with 'exec init', the best way to
 # log back in is ssh. But you can also do this from another terminal:
 #
-#   sudo nsenter -t $(sudo pgrep -nfx init) -ea chroot / sudo bash -l
+#   sudo nsenter -t $(sudo pgrep -nfx init) -ea chroot / su -
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 #set -x # debug flag
 set -eu
 
@@ -132,11 +132,16 @@ if [ -n "${ANDROID_ROOT:-}" ] && [ -n "${ANDROID_DATA:-}" ]; then
     # Android does have iproute2 ip command
     ip() { /system/bin/ip "$@"; }
 
-    # toybox mount is missing required features
     if command -v busybox >/dev/null 2>&1; then
         mount() { busybox mount "$@"; }
     elif [ "$(command -v mount)" = "/system/bin/mount" ]; then
         die "toybox mount is not supported"
+    fi
+
+    # toybox mount is missing required features
+    if [ "$(command -v mount)" = "/system/bin/mount" ]; then
+        command -v busybox >/dev/null 2>&1 || die "toybox mount is not supported"
+        mount() { busybox mount "$@"; }
     fi
 fi
 
@@ -274,11 +279,10 @@ if [ "${PHASE2:-}" = "1" ]; then
     export PATH="$PATH:/lib/cargo/bin/coreutils"
 
     mkdir -p "$ROOTFS/old_root" && cd "$ROOTFS"
-    pivot_root . old_root
-#    umount -l /old_root && rmdir /old_root
+    pivot_root . old_root && cd /
 
     # On Termux with tsu, chroot immediately after pivot_root is required
-    exec chroot / env -i \
+    exec chroot . env -i \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         HOME=/root \
         TERM=xterm-256color \
@@ -341,7 +345,7 @@ cleanup_custom_routes() {
         ip rule del from "$ip4" lookup "$table" priority "$prio" 2>/dev/null
         ip -6 rule del from "$ip6" lookup "$table" priority "$prio" 2>/dev/null
     done < "$RT_DIR/custom_routes"
-    rm -f -- "$RT_DIR/custom_routes"
+    rm -f -- "$RT_DIR/custom_routes" && exit 0
 }
 
 # If port ranges overlap, the most recently started
@@ -415,7 +419,6 @@ setup_netns() {
         $ns_exec ip route add default via "$BRIDGE_IP"
         $ns_exec ip -6 addr add "${ct_ip6}${SUBNET6}" dev "$peer"
         $ns_exec ip -6 route add default via "$BRIDGE_IP6"
-
         info "Created veth pair for $HOSTNAME ($ct_ip4, $ct_ip6)"
     fi
 }
@@ -461,15 +464,13 @@ setup_android_routing() {
         fi
     done
 
-    return 0
-
     # The approach above is more effective, keep this here for future reference
-    for table in $vpn wlan0 eth0 $cellular; do
-        if check_ip_rule "lookup $table"; then
-            ndc ipfwd remove "$BRIDGE" "$table" >/dev/null
-            ndc ipfwd add "$BRIDGE" "$table" >/dev/null
-        fi
-    done
+#    for iface in $vpn wlan0 eth0 $cellular; do
+#        if check_ip_rule "lookup $interface"; then
+#            ndc ipfwd remove "$BRIDGE" "$iface" >/dev/null
+#            ndc ipfwd add "$BRIDGE" "$iface" >/dev/null
+#        fi
+#    done
 }
 
 # Now to the good part, this function sets up per-container routing
@@ -507,10 +508,10 @@ usage() {
 Usage: nspawn [OPTIONS] <rootfs> [command...]
 
 Options:
-  -n, --net                   Enable network namespace
-  -P, --port-range START:END  Port forwarding range
-  -r, --route-via IFACE       Route container through specific interface (requires --net)
-  -c, --cleanup-route         Remove all custom --route-via rules and exit
+  -N, --net                   Enable network namespace
+  -P, --port-range START:END  Port forwarding range (requires --net)
+  -R, --route-via IFACE       Route container through specific interface (requires --net)
+  -C, --cleanup-route         Remove all custom --route-via rules and exit
   -h, --help                  Show this help
 
 EOF
@@ -529,6 +530,7 @@ while [ $# -gt 0 ]; do
         -P|--port-range)
             [ $# -lt 2 ] && die "--port-range requires START:END"
             PORT_RANGE="$2"
+            [ -n "${PORT_RANGE:-}" ] && [ "${USE_NETNS:-}" != "1" ] && die "--port-range requires --net"
             case "$PORT_RANGE" in
                 *:*) ;;
                 *) die "Invalid port range format. Use START:END (e.g., 1080:30000)" ;;
@@ -544,7 +546,6 @@ while [ $# -gt 0 ]; do
         -C|--cleanup-route)
             [ "$(id -u)" -eq 0 ] || die "Must be root"
             cleanup_custom_routes
-            exit 0
             ;;
         -V|--version)
             echo "nspawn version $VERSION"
@@ -578,9 +579,6 @@ fi
 
 ROOTFS=$(cd "$ROOTFS" && pwd -P)
 HOSTNAME=$(basename "$ROOTFS" | tr '_' '-')
-BRIDGE_HASH=$(printf '%s' "$BRIDGE" | md5sum | awk '{print $1}')
-NETNS_NAME="$BRIDGE-$(printf '%s' "$BRIDGE_HASH$ROOTFS" | md5sum | awk '{print substr($1,1,8)}')"
-VETH_NAME="$(printf '%s' "$BRIDGE_HASH$NETNS_NAME" | md5sum | awk '{print substr($1,1,8)}')"
 
 check_ns() { unshare "$1" true 2>/dev/null; }
 
@@ -601,6 +599,12 @@ if [ "${USE_NETNS:-}" = "1" ]; then
     if ! command -v iptables >/dev/null 2>&1; then
         die "--net require iptables command"
     fi
+
+    HASH_TOOL=$(command -v md5sum || echo cksum)
+
+    BRIDGE_HASH=$(printf '%s' "$BRIDGE" | $HASH_TOOL | awk '{print $1}')
+    NETNS_NAME="$BRIDGE-$(printf '%s' "$BRIDGE_HASH$ROOTFS" | $HASH_TOOL | awk '{print substr($1,1,8)}')"
+    VETH_NAME="$(printf '%s' "$BRIDGE_HASH$NETNS_NAME" | $HASH_TOOL | awk '{print substr($1,1,8)}')"
 
     if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
         if ip route | grep -q "$BRIDGE_SUBNET"; then
