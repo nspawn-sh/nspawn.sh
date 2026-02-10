@@ -491,8 +491,8 @@ android_custom_routing() {
     octet="${ct_ip4##*.}"
     prio=$((prio + octet))
 
-    ip rule add from "$ct_ip4" lookup "$ROUTE_VIA" priority "$prio"
-    ip -6 rule add from "$ct_ip6" lookup "$ROUTE_VIA" priority "$prio"
+    ip rule add from "$ct_ip4" lookup "$ROUTE_VIA" priority "$prio" 2>/dev/null || true
+    ip -6 rule add from "$ct_ip6" lookup "$ROUTE_VIA" priority "$prio" 2>/dev/null || true
 
     mkdir -p "$RT_DIR"
     echo "$prio $ct_ip4 $ct_ip6 $ROUTE_VIA" >> "$RT_DIR/custom_routes"
