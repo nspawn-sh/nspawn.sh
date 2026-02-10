@@ -1,0 +1,666 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LongQT-sea <long025733@gmail.com>
+#
+# nspawn - chroot on steroids
+#
+# A ~500-line POSIX shell script that implements minimal Linux
+# container using namespaces, bind mounts, and pivot_root.
+#
+# No daemons. No D-Bus. No dependencies beyond a POSIX shell,
+# a few coreutils or busybox, and a kernel >= 4.19.
+#
+# Why?
+#
+# Because containers are just namespaces + bind mounts + pivot_root.
+# That's it. Everything else is optional. This script exists to prove that point.
+#
+# The goal is do the hard part once so you never have to again.
+# We set up the namespace plumbing so you get a clean Linux environment,
+# then get out of the way and let you work natively inside it.
+#
+# Android support is a first-class concern, not an afterthought.
+# Smartphones are the computers people actually have. Over 6 billion
+# of them exist. A Snapdragon 865 from 2020 matches an old desktop i5
+# while sipping single-digit watts. These are real computers
+# more powerful than the servers that ran the early internet.
+#
+# A phone with a cracked screen and a dead battery is still a
+# perfectly good 8-core Linux server with no moving parts that
+# fits in your pocket. Billions of them get landfilled every year.
+# The hardware is fine; the software ecosystem threw it away.
+# Running a real Linux userspace on these devices isn't a hack,
+# it's the sane thing to do.
+#
+# If your rooted phone has a kernel that supports namespaces (4.19+),
+# this script will run a full Linux userspace on it -- Debian, Arch,
+# Alpine, whatever you need, the companion getroot tool has you covered.
+#
+# This means: toybox pivot_root, busybox mount fallbacks,
+# iproute2 from /system/bin/ip, routing policy for VPN/WiFi/LTE,
+# and working around every quirk Android throws at you.
+# It's ugly, but it works, and that matters more.
+#
+# Tested on Android (toybox, busybox, Termux), Alpine, Debian, and bare
+# busybox containers. If you have unshare, mount, and pivot_root,
+# this script will work.
+#
+# Design:
+#
+#   Phase 1 (runs as root on the host)
+#     - Parse arguments
+#     - Set up bridge networking and NAT (if --net)
+#     - Create a network namespace and veth pair
+#     - Detect available namespace support
+#     - exec into Phase 2 via unshare(1)
+#
+#   Phase 2 (runs inside the new namespace)
+#     - Bind mount the rootfs
+#     - Mount /proc, /sys, /dev, /tmp, /run
+#     - Create minimal device nodes
+#     - Mask sensitive paths (/proc/keys, /sys/firmware, etc.)
+#     - pivot_root into the new rootfs
+#     - exec the requested command (or a login shell)
+#
+# The mount namespace is the key insight: by doing all our bind
+# mounts inside a new mount namespace, cleanup is automatic.
+# When the process exits, the namespace is destroyed, and every
+# mount we made disappears with it. No cleanup code needed.
+# This is the right way to do it.
+#
+# Usage:
+#   nspawn <rootfs>                    # shell into a container
+#   nspawn --net <rootfs>              # with network namespace
+#   nspawn --net --port-range 80:8080 <rootfs>  # with port forwarding
+#   nspawn --net --route-via tun0 <rootfs>  # pin container to VPN
+#   nspawn <rootfs> /bin/bash -l       # specific command
+#
+# To get internet inside the container with --net, the host needs
+# ip_forward=1 and iptables MASQUERADE, which this script sets up.
+# On Android, source-based policy routing is configured automatically
+# to handle VPN/WiFi/LTE priority.
+#
+# If you boot systemd init with 'exec init', the best way to
+# log back in is ssh. But you can also do this from another terminal:
+#
+#   sudo nsenter -t $(sudo pgrep -nfx init) -ea chroot / sudo bash -l
+
+VERSION="1.0.0"
+#set -x # debug flag
+set -eu
+
+# Android routing priority
+# Default: VPN > WiFi > Mobile data
+# Lower number = higher priority
+VPN_PRIO=7777
+WIFI_PRIO=8888
+MOBILE_PRIO=9999
+
+NET_PREFIX="10.11.0"
+SUBNET="/24"
+BRIDGE_SUBNET="${NET_PREFIX}.0${SUBNET}"
+BRIDGE_IP="${NET_PREFIX}.1"
+
+NET6_PREFIX="fd11::"
+SUBNET6="/64"
+BRIDGE_SUBNET6="${NET6_PREFIX}${SUBNET6}"
+BRIDGE_IP6="${NET6_PREFIX}1"
+
+BRIDGE="nspawn_br1"
+PORT_RANGE=""
+WAN_IF="wlan0"
+
+RT_DIR="/run/nspawn"
+NETNS_DIR="/run/netns"
+RED=$(printf '\033[31m')
+GREEN=$(printf '\033[32m')
+NC=$(printf '\033[0m')
+
+die() { printf '%sError: %s%s\n' "$RED" "$*" "$NC" >&2; exit 1; }
+info() { printf '%s==> %s%s\n' "$GREEN" "$*" "$NC" >&2; }
+
+# Android quirks
+if [ -n "${ANDROID_ROOT:-}" ] && [ -n "${ANDROID_DATA:-}" ]; then
+    ANDROID=1
+    RT_DIR="/mnt/nspawn"
+    NETNS_DIR="/mnt/run"
+    _PATH="/usr/sbin:/usr/bin:/sbin:/bin:/system/bin"
+
+    # Yes toybox does have pivot_root
+    pivot_root() { toybox pivot_root "$@"; }
+
+    # Android does have iproute2 ip command
+    ip() { /system/bin/ip "$@"; }
+
+    # toybox mount is missing required features
+    if command -v busybox >/dev/null 2>&1; then
+        mount() { busybox mount "$@"; }
+    elif [ "$(command -v mount)" = "/system/bin/mount" ]; then
+        die "toybox mount is not supported"
+    fi
+fi
+
+if command -v unshare >/dev/null; then
+    unshare() { command unshare "$@"; }
+elif command -v busybox && busybox unshare --help >/dev/null 2>&1; then
+    unshare() { busybox unshare "$@"; }
+else
+    die "Need unshare command"
+fi
+
+# === Phase 2 ===
+if [ "${PHASE2:-}" = "1" ]; then
+    # Run inside a Linux namespace (at least a mount namespace)
+    ROOTFS="$1"
+    shift
+
+    if [ $# -eq 0 ]; then
+        if [ -x "$ROOTFS/bin/bash" ]; then
+            set -- /bin/bash -il
+        else
+            set -- /bin/sh -il
+        fi
+    fi
+
+    if [ "${UTS_NS:-}" = "1" ]; then
+        echo "$HOSTNAME" > /proc/sys/kernel/hostname
+        echo "$HOSTNAME" > "$ROOTFS/etc/hostname"
+        grep -q "127.0.1.1.*$HOSTNAME" "$ROOTFS/etc/hosts" 2>/dev/null || \
+            echo "127.0.1.1	$HOSTNAME" >> "$ROOTFS/etc/hosts"
+    fi
+
+    mount -o bind,private "$ROOTFS" "$ROOTFS"
+
+    # Android quirks
+    mount -o remount,suid,dev "$ROOTFS"
+
+    # This makes the `ip rule` command inside the container show human-readable rule name when using host network
+    # https://android.googlesource.com/platform/system/netd/+/refs/heads/main/server/RouteController.h#105
+    if [ "${USE_NETNS:-}" != "1" ] && [ "${ANDROID:-}" = "1" ]; then
+        mkdir -p "$ROOTFS/etc/iproute2"
+        touch "$ROOTFS/etc/iproute2/rt_tables"
+        mount -o bind /data/misc/net/rt_tables "$ROOTFS/etc/iproute2/rt_tables"
+    fi
+
+    # Expose Android user 0 internal storage to the container
+    if [ "${ANDROID:-}" = "1" ] && [ -d /data/media/0 ]; then
+        mkdir -p "$ROOTFS/mnt/storage"
+        mount -o bind /data/media/0 "$ROOTFS/mnt/storage"
+    fi
+
+    mount -t proc -o nosuid,nodev,noexec proc "$ROOTFS/proc"
+    mount -t sysfs -o ro,nosuid,nodev,noexec sysfs "$ROOTFS/sys"
+    mount -t cgroup2 -o nosuid,noexec,nodev cgroup2 "$ROOTFS/sys/fs/cgroup"
+    mount -t tmpfs -o nosuid,nodev,noatime tmpfs "$ROOTFS/tmp"
+    mount -t tmpfs -o rw,nosuid,nodev,mode=755 tmpfs "$ROOTFS/run"
+    mount -t tmpfs -o nosuid,mode=755,strictatime,size=65536k tmpfs "$ROOTFS/dev"
+
+    # Minimal /dev setup; a classic bind mount of /dev is usually overkill
+    mkdir -p "$ROOTFS/dev/pts" "$ROOTFS/dev/shm" "$ROOTFS/dev/net" "$ROOTFS/dev/mqueue"
+    mount -t tmpfs -o nosuid,noexec,nodev,mode=1777,size=524288k shm "$ROOTFS/dev/shm"
+    mount -t mqueue -o rw,nosuid,nodev,noexec,relatime mqueue "$ROOTFS/dev/mqueue"
+
+    mknod -m 666 "$ROOTFS/dev/null" c 1 3
+    mknod -m 666 "$ROOTFS/dev/zero" c 1 5
+    mknod -m 666 "$ROOTFS/dev/full" c 1 7
+    mknod -m 666 "$ROOTFS/dev/tty" c 5 0
+    mknod -m 666 "$ROOTFS/dev/fuse" c 10 229
+    mknod -m 666 "$ROOTFS/dev/random" c 1 8
+    mknod -m 666 "$ROOTFS/dev/urandom" c 1 9
+    mknod -m 620 "$ROOTFS/dev/console" c 136 0
+    mknod -m 666 "$ROOTFS/dev/net/tun" c 10 200
+
+    ln -sf pts/ptmx "$ROOTFS/dev/ptmx"
+    ln -sf /proc/self/fd "$ROOTFS/dev/fd"
+    ln -sf /proc/self/fd/0 "$ROOTFS/dev/stdin"
+    ln -sf /proc/self/fd/1 "$ROOTFS/dev/stdout"
+    ln -sf /proc/self/fd/2 "$ROOTFS/dev/stderr"
+
+#    mount -t devpts -o nosuid,noexec,newinstance,mode=620,ptmxmode=0666 devpts "$ROOTFS/dev/pts"
+    mount -o bind /dev/pts "$ROOTFS/dev/pts"
+    mount -o remount,ptmxmode=0666,mode=620 "$ROOTFS/dev/pts"
+
+    # Try hook pty -> /dev/console for console login, but that didn't work out, by masking console-getty
+    # at least we still have a console log with job control (Ctrl-C to shutdown systemd)
+    if [ -t 0 ]; then
+        mount -o bind "$(tty)" "$ROOTFS/dev/console"
+    fi
+
+    if [ -f "$ROOTFS/usr/lib/systemd/systemd" ]; then
+        ln -sf /dev/null "$ROOTFS/etc/systemd/system/console-getty.service"
+        ln -sf /dev/null "$ROOTFS/etc/systemd/system/systemd-firstboot.service"
+        ln -sf /dev/null "$ROOTFS/etc/systemd/system/systemd-networkd-wait-online.service"
+    fi
+
+    mask_path() {
+        path="$1"
+        target="${ROOTFS}${path}"
+        if [ -d "$target" ]; then
+            mount -t tmpfs -o ro,nosuid,nodev,noexec,size=0 tmpfs "$target"
+        elif [ -f "$target" ]; then
+            mount -o bind /dev/null "$target"
+        fi
+    }
+
+    readonly_path() {
+        target="${ROOTFS}${1}"
+        if [ -e "$target" ]; then
+            mount -o bind,ro "$target" "$target"
+        fi
+    }
+
+    # Protect sensitive paths
+    mask_path "/proc/asound"
+    mask_path "/proc/sched_debug"
+    mask_path "/proc/scsi"
+    mask_path "/proc/keys"
+    mask_path "/proc/timer_list"
+    mask_path "/proc/kmsg"
+    mask_path "/sys/firmware"
+    mask_path "/sys/power"
+    mask_path "/sys/class/drm"
+    readonly_path "/proc/bus"
+    readonly_path "/proc/fs"
+    readonly_path "/proc/irq"
+    readonly_path "/proc/sysrq-trigger"
+
+    # Android quirks
+    if [ "${ANDROID:-}" = "1" ]; then
+        echo "0 2147483647" > "$ROOTFS/proc/sys/net/ipv4/ping_group_range"
+        export PATH="$_PATH" && unset LD_PRELOAD
+    fi
+
+    # Ubuntu 25 Rust quirk
+    export PATH="$PATH:/lib/cargo/bin/coreutils"
+
+    mkdir -p "$ROOTFS/old_root" && cd "$ROOTFS"
+    pivot_root . old_root
+#    umount -l /old_root && rmdir /old_root
+
+    # On Termux with tsu, chroot immediately after pivot_root is required
+    exec chroot / env -i \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        HOME=/root \
+        TERM=xterm-256color \
+        /bin/sh -c 'cd; umount -l /old_root && rmdir /old_root; exec "$@"' -- "$@"
+fi
+
+# === Networking functions ===
+check_ip_rule() { ip rule list | grep -q "$1"; }
+
+add_ipt_rule() {
+    cmd="$1"; shift
+
+    check_args=""
+    for arg in "$@"; do
+        case "$arg" in
+            -A|-I) check_args="$check_args -C" ;;
+            *) check_args="$check_args $arg" ;;
+        esac
+    done
+
+    $cmd $check_args 2>/dev/null || "$cmd" "$@"
+}
+
+get_next_ip() {
+    count=2
+    for ns in "$NETNS_DIR"/*; do
+        [ -e "$ns" ] && count=$((count + 1))
+    done
+    echo "${NET_PREFIX}.${count}"
+}
+
+find_free_subnet() {
+    octet=1
+    while [ "$octet" -lt 254 ]; do
+        if [ "$1" = "4" ]; then
+            candidate="10.11.${octet}.0${SUBNET}"
+            if ! ip route | grep -q "$candidate"; then
+                NET_PREFIX="10.11.${octet}"
+                BRIDGE_SUBNET="${NET_PREFIX}.0${SUBNET}"
+                BRIDGE_IP="${NET_PREFIX}.1"
+                return 0
+            fi
+        else
+            hex=$(printf '%02x' "$octet")
+            candidate="fd${hex}::${SUBNET6}"
+            if ! ip -6 r l t all | grep -q "$candidate"; then
+                NET6_PREFIX="fd${hex}::"
+                BRIDGE_SUBNET6="${NET6_PREFIX}${SUBNET6}"
+                BRIDGE_IP6="${NET6_PREFIX}1"
+                return 0
+            fi
+        fi
+        octet=$((octet + 1))
+    done
+}
+
+cleanup_custom_routes() {
+    [ -f "$RT_DIR/custom_routes" ] || return 0
+    while read -r prio ip4 ip6 table; do
+        ip rule del from "$ip4" lookup "$table" priority "$prio" 2>/dev/null
+        ip -6 rule del from "$ip6" lookup "$table" priority "$prio" 2>/dev/null
+    done < "$RT_DIR/custom_routes"
+    rm -f -- "$RT_DIR/custom_routes"
+}
+
+# If port ranges overlap, the most recently started
+# container takes precedence in the port forwarding rules
+setup_port_forward() {
+    ct_ip4="$1"
+    ct_ip6="${NET6_PREFIX}${1##*.}"
+
+    for proto in tcp udp; do
+        add_ipt_rule iptables  -t nat -I PREROUTING -i "$WAN_IF" -p "$proto" --dport "$PORT_RANGE" -j DNAT --to-destination "$ct_ip4"
+        add_ipt_rule ip6tables -t nat -I PREROUTING -i "$WAN_IF" -p "$proto" --dport "$PORT_RANGE" -j DNAT --to-destination "$ct_ip6"
+    done
+
+    # Don't forward Termux ssh
+    [ "${ANDROID:-}" = "1" ] && for ipt_cmd in iptables ip6tables; do
+        "$ipt_cmd" -t nat -D PREROUTING -p tcp --dport 8022 -j RETURN 2>/dev/null || true
+        "$ipt_cmd" -t nat -I PREROUTING -p tcp --dport 8022 -j RETURN
+    done
+}
+
+setup_bridge() {
+    if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
+        ip link add name "$BRIDGE" type bridge
+        ip addr add "${BRIDGE_IP}${SUBNET}" dev "$BRIDGE"
+        ip -6 addr add "${BRIDGE_IP6}${SUBNET6}" dev "$BRIDGE"
+        ip link set "$BRIDGE" up
+        info "Bridge $BRIDGE created"
+    fi
+
+    #  IP forward and NAT
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+
+    # It would be nice if we could just use netd, unfortunately, it only NAT for IPv4.
+#    ndc nat enable "$BRIDGE" "$iface" 1 >/dev/null
+    add_ipt_rule iptables  -t nat -I POSTROUTING -s "$BRIDGE_SUBNET" ! -d "$BRIDGE_SUBNET" -j MASQUERADE
+    add_ipt_rule ip6tables -t nat -I POSTROUTING -s "$BRIDGE_SUBNET6" ! -d "$BRIDGE_SUBNET6" -j MASQUERADE
+
+    for ipt_cmd in iptables ip6tables; do
+        add_ipt_rule "$ipt_cmd" -t filter -I INPUT   -i "$BRIDGE" -j ACCEPT
+        add_ipt_rule "$ipt_cmd" -t filter -I OUTPUT  -o "$BRIDGE" -j ACCEPT
+        add_ipt_rule "$ipt_cmd" -t filter -I FORWARD -i "$BRIDGE" -j ACCEPT
+        add_ipt_rule "$ipt_cmd" -t filter -I FORWARD -o "$BRIDGE" -j ACCEPT
+    done
+}
+
+setup_netns() {
+    ct_ip4="$1"
+    ct_ip6="${NET6_PREFIX}${ct_ip4##*.}"
+
+    veth="veth_${VETH_NAME}"
+    peer="eth0_${VETH_NAME}"
+
+    if [ ! -e "$NETNS_DIR/$NETNS_NAME" ]; then
+        ip netns add "$NETNS_NAME"
+        info "Created netns: $NETNS_NAME"
+    else
+        info "Reuse netns: $NETNS_NAME"
+    fi
+
+    if ! ip link show "$veth" >/dev/null 2>&1; then
+        ip link add "$veth" type veth peer name "$peer"
+        ip link set "$veth" master "$BRIDGE"
+        ip link set "$veth" up
+        ip link set "$peer" netns "$NETNS_NAME"
+
+        ns_exec="ip netns exec $NETNS_NAME"
+        $ns_exec ip link set lo up
+        $ns_exec ip link set "$peer" up
+        $ns_exec ip addr add "${ct_ip4}${SUBNET}" dev "$peer"
+        $ns_exec ip route add default via "$BRIDGE_IP"
+        $ns_exec ip -6 addr add "${ct_ip6}${SUBNET6}" dev "$peer"
+        $ns_exec ip -6 route add default via "$BRIDGE_IP6"
+
+        info "Created veth pair for $HOSTNAME ($ct_ip4, $ct_ip6)"
+    fi
+}
+
+# Android policy-based routing quirks
+# On Android, if VPN apps are installed on both the work and main profiles,
+# the first one to connect creates the 'tun0' interface, and the next creates 'tun1'.
+# Some custom ROMs allow multiple profiles to be active simultaneously, making it
+# possible to have even more routing tables (e.g., tun2, tun3, tun4,...).
+# The goal of this function is to have a baseline working connectivity.
+setup_android_routing() {
+    cellular="rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4"
+    vpn="tun0 tun1"
+
+    ip_rule_add() {
+        table="$1"; prio="$2"
+        ip rule del priority "$prio" 2>/dev/null || true
+        ip rule add iif "$BRIDGE" lookup "$table" priority "$prio"
+        ip -6 rule del priority "$prio" 2>/dev/null || true
+        ip -6 rule add iif "$BRIDGE" lookup "$table" priority "$prio"
+    }
+
+    ip route replace "$BRIDGE_SUBNET" dev "$BRIDGE" table local_network
+    ip -6 route replace "$BRIDGE_SUBNET6" dev "$BRIDGE" table local_network
+
+    # Ensure hotspot clients can reach container directly
+    ip_rule_add local_network 6666
+
+    # VPN tunnels
+    for table in $vpn; do
+        check_ip_rule "lookup $table" && ip_rule_add "$table" "$VPN_PRIO"
+    done
+
+    # Wifi or ethernet
+    for table in wlan0 eth0; do
+        check_ip_rule "lookup $table" && ip_rule_add "$table" "$WIFI_PRIO"
+    done
+
+    # Cellular
+    for table in $cellular; do
+        if check_ip_rule "lookup $table"; then
+            ip_rule_add "$table" "$MOBILE_PRIO"
+        fi
+    done
+
+    return 0
+
+    # The approach above is more effective, keep this here for future reference
+    for table in $vpn wlan0 eth0 $cellular; do
+        if check_ip_rule "lookup $table"; then
+            ndc ipfwd remove "$BRIDGE" "$table" >/dev/null
+            ndc ipfwd add "$BRIDGE" "$table" >/dev/null
+        fi
+    done
+}
+
+# Now to the good part, this function sets up per-container routing
+# so you can pin specific containers to specific interfaces.
+# Container at .2 goes through tun0, .3 through wlan0, etc.
+# When the interface drops, the table goes blank and the kernel
+# falls through to the next rule. Free failover, zero code.
+android_custom_routing() {
+    [ -z "${ROUTE_VIA:-}" ] && return 0
+
+    if ! check_ip_rule "lookup $ROUTE_VIA"; then
+        die "--route-via $ROUTE_VIA: no routing table found (interface down?)"
+    fi
+
+    ct_ip4="$1"
+    ct_ip6="${NET6_PREFIX}${ct_ip4##*.}"
+
+    prio=5000
+    octet="${ct_ip4##*.}"
+    prio=$((prio + octet))
+
+    ip rule add from "$ct_ip4" lookup "$ROUTE_VIA" priority "$prio"
+    ip -6 rule add from "$ct_ip6" lookup "$ROUTE_VIA" priority "$prio"
+
+    mkdir -p "$RT_DIR"
+    echo "$prio $ct_ip4 $ct_ip6 $ROUTE_VIA" >> "$RT_DIR/custom_routes"
+
+    info "Routing $ct_ip4 ($ct_ip6) via $ROUTE_VIA"
+}
+
+# === Phase 1 ===
+usage() {
+    cat <<EOF
+
+Usage: nspawn [OPTIONS] <rootfs> [command...]
+
+Options:
+  -n, --net                   Enable network namespace
+  -P, --port-range START:END  Port forwarding range
+  -r, --route-via IFACE       Route container through specific interface (requires --net)
+  -c, --cleanup-route         Remove all custom --route-via rules and exit
+  -h, --help                  Show this help
+
+EOF
+    exit 0
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        -N|--net)
+            USE_NETNS=1
+            shift
+            ;;
+        -P|--port-range)
+            [ $# -lt 2 ] && die "--port-range requires START:END"
+            PORT_RANGE="$2"
+            case "$PORT_RANGE" in
+                *:*) ;;
+                *) die "Invalid port range format. Use START:END (e.g., 1080:30000)" ;;
+            esac
+            shift 2
+            ;;
+        -R|--route-via)
+            [ $# -lt 2 ] && die "--route-via requires interface name (e.g., tun0, wlan0)"
+            ROUTE_VIA="$2"
+            [ -n "${ROUTE_VIA:-}" ] && [ "${USE_NETNS:-}" != "1" ] && die "--route-via requires --net"
+            shift 2
+            ;;
+        -C|--cleanup-route)
+            [ "$(id -u)" -eq 0 ] || die "Must be root"
+            cleanup_custom_routes
+            exit 0
+            ;;
+        -V|--version)
+            echo "nspawn version $VERSION"
+            exit 0
+            ;;
+        -*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ $# -eq 0 ]; then usage; fi
+
+ROOTFS="$1"
+shift
+
+[ -d "$ROOTFS" ] || die "Rootfs not found"
+
+[ "$(id -u)" -eq 0 ] || die "Must be root"
+
+# Require 2020+ Android devices
+kernel_version=$(uname -r)
+major=$(echo "$kernel_version" | cut -d. -f1)
+minor=$(echo "$kernel_version" | cut -d. -f2)
+if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 19 ]; }; then
+    die "Kernel version must be >= 4.19"
+fi
+
+ROOTFS=$(cd "$ROOTFS" && pwd -P)
+HOSTNAME=$(basename "$ROOTFS" | tr '_' '-')
+BRIDGE_HASH=$(printf '%s' "$BRIDGE" | md5sum | awk '{print $1}')
+NETNS_NAME="$BRIDGE-$(printf '%s' "$BRIDGE_HASH$ROOTFS" | md5sum | awk '{print substr($1,1,8)}')"
+VETH_NAME="$(printf '%s' "$BRIDGE_HASH$NETNS_NAME" | md5sum | awk '{print substr($1,1,8)}')"
+
+check_ns() { unshare "$1" true 2>/dev/null; }
+
+# Setup networking if requested
+if [ "${USE_NETNS:-}" = "1" ]; then
+    if ! check_ns -n; then
+        die "--net require kernel with network namespace support"
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        if readlink "$(command -v ip)" 2>/dev/null | grep -q busybox; then
+            die "--net require ip command from iproute2"
+        fi
+    else
+        die "--net require ip command from iproute2"
+    fi
+
+    if ! command -v iptables >/dev/null 2>&1; then
+        die "--net require iptables command"
+    fi
+
+    if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
+        if ip route | grep -q "$BRIDGE_SUBNET"; then
+            info "Subnet $BRIDGE_SUBNET conflicts with existing route, finding alternative..."
+            find_free_subnet 4
+        fi
+
+        if ip -6 route list table all | grep -q "$BRIDGE_SUBNET6"; then
+            info "Subnet $BRIDGE_SUBNET6 conflicts with existing route, finding alternative..."
+            find_free_subnet 6
+        fi
+    fi
+
+    setup_bridge
+
+    [ "${ANDROID:-}" = "1" ] && setup_android_routing
+
+    if [ -e "$NETNS_DIR/$NETNS_NAME" ]; then
+        CT_IP=$(ip netns exec "$NETNS_NAME" ip addr show "eth0_${VETH_NAME}" 2>/dev/null | \
+                grep -oE "${NET_PREFIX}\.[0-9]+" | head -1)
+        [ -z "$CT_IP" ] && CT_IP=$(get_next_ip)
+    else
+        CT_IP=$(get_next_ip)
+    fi
+
+    setup_netns "$CT_IP"
+    [ -n "${PORT_RANGE:-}" ] && setup_port_forward "$CT_IP"
+    [ "${ANDROID:-}" = "1" ] && android_custom_routing "$CT_IP"
+    NETNS_ENTER="ip netns exec $NETNS_NAME"
+fi
+
+check_ns -p && PID_NS=1
+check_ns -i && IPC_NS=1
+check_ns -u && UTS_NS=1
+check_ns -m && MOUNT_NS=1
+
+if unshare --root / true 2>/dev/null; then
+    FULL_UNSHARE=1
+    check_ns -T && TIME_NS=1
+    check_ns -C && CGROUP_NS=1
+fi
+
+[ "${PID_NS:-}" = 1 ] && ARGS="${ARGS:-} -p -f"
+[ "${IPC_NS:-}" = 1 ] && ARGS="${ARGS:-} -i"
+[ "${UTS_NS:-}" = 1 ] && ARGS="${ARGS:-} -u"
+[ "${MOUNT_NS:-}" = 1 ] && ARGS="${ARGS:-} -m"
+
+if [ "${FULL_UNSHARE:-}" = 1 ]; then
+    ARGS="${ARGS:-} --kill-child"
+    [ "${TIME_NS:-}" = 1 ] && ARGS="${ARGS:-} -T"
+    [ "${CGROUP_NS:-}" = 1 ] && ARGS="${ARGS:-} -C"
+fi
+
+# Start phase 2
+export PHASE2=1
+export HOSTNAME
+export UTS_NS
+export USE_NETNS
+if [ "${MOUNT_NS:-}" = "1" ]; then
+    exec ${NETNS_ENTER:-} unshare $ARGS -- "$0" "$ROOTFS" "$@"
+else
+    die "Kernel lacks mount namespace support"
+fi
