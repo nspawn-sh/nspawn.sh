@@ -4,11 +4,44 @@ A ~500-line POSIX shell script that implements minimal Linux containers using na
 
 No daemons. No D-Bus. No dependencies beyond a POSIX shell, a few coreutils (or busybox), and a kernel ≥ 4.19.
 
+## Quick start
+
+### Install:
+```sh
+curl -fL https://raw.githubusercontent.com/nspawn-sh/nspawn.sh/main/install.sh | sh
 ```
-nspawn <rootfs>                              # shell into a container
-nspawn --net <rootfs>                        # with isolated network
-nspawn --net --route-via tun0 <rootfs>       # pinned to VPN
-nspawn --net --port-range 80:8080 <rootfs>   # with port forwarding
+
+### Get a rootfs:
+
+```sh
+# Download and extract a Debian rootfs to current directory
+sudo getroot debian
+
+# For older version
+sudo getroot debian:12
+
+# For Ubuntu, Alpine, Arch, Fedora, ...
+sudo getroot alpine
+sudo getroot ubuntu:24
+```
+
+### Run it:
+
+```sh
+# Basic container (host network)
+sudo nspawn debian_trixie
+
+# With network namespace
+sudo nspawn --net debian_trixie
+
+# Run a specific command
+sudo nspawn debian_trixie /bin/bash -l
+
+# Port forwarding from wifi to container:
+nspawn --net --port-range 80:8080 <rootfs>
+
+# Android: Custom route when using multi-wan
+nspawn --net --route-via wlan0 <rootfs>
 ```
 
 ## Why
@@ -29,32 +62,6 @@ with no moving parts that fits in your pocket. Billions of them get landfilled e
 The hardware is fine; the software ecosystem threw it away.
 
 If your rooted phone has a kernel ≥ 4.19 with namespace support, this script will run a full Linux userspace on it — Debian, Arch, Alpine, whatever you need.
-
-## Quick start
-
-**Get a rootfs:**
-
-```sh
-# Download and extract a Debian rootfs
-sudo ./getroot debian:13
-
-# Or Ubuntu, Alpine, Arch, Fedora, ...
-sudo ./getroot alpine:edge
-sudo ./getroot ubuntu:24
-```
-
-**Run it:**
-
-```sh
-# Basic container (host network)
-sudo ./nspawn debian_trixie
-
-# With network isolation
-sudo ./nspawn --net debian_trixie
-
-# Run a specific command
-sudo ./nspawn debian_trixie /bin/bash -l
-```
 
 ## What's in the box
 
@@ -132,10 +139,10 @@ The bridge, NAT, and IP forwarding are set up automatically.
 
 ```sh
 # This container goes through VPN
-sudo ./nspawn --net --route-via tun0 vpn_rootfs
+sudo nspawn --net --route-via tun0 vpn_rootfs
 
 # This one uses WiFi directly
-sudo ./nspawn --net --route-via wlan0 wifi_rootfs
+sudo nspawn --net --route-via wlan0 wifi_rootfs
 ```
 
 When an interface drops, the kernel falls through to the next routing rule. Free failover, zero code.
@@ -143,7 +150,7 @@ When an interface drops, the kernel falls through to the next routing rule. Free
 **Port forwarding** with `--port-range` exposes container ports to the host's WAN interface:
 
 ```sh
-sudo ./nspawn --net --port-range 80:8080 my_server
+sudo nspawn --net --port-range 80:8080 my_server
 ```
 
 ### Android specifics
@@ -176,18 +183,18 @@ A companion rootfs downloader. Fetches pre-built images from [images.linuxcontai
 
 ```sh
 # Download by name:release
-sudo ./getroot debian:13
-sudo ./getroot ubuntu:24.04
-sudo ./getroot alpine:edge
+sudo getroot debian:13
+sudo getroot ubuntu:24.04
+sudo getroot alpine:edge
 
 # Specify output directory
-sudo ./getroot debian:13 -o my_debian
+sudo getroot debian:13 -o my_debian
 
 # List all available images
-sudo ./getroot --list
+sudo getroot --list
 
 # Search releases for a distro
-sudo ./getroot --search debian
+sudo getroot --search debian
 ```
 
 Supported distros include: Debian, Ubuntu, Alpine, Arch, Fedora, CentOS, Kali, Gentoo,
