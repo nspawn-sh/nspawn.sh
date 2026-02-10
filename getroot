@@ -9,7 +9,7 @@
 set -eu
 
 SERVER="https://images.linuxcontainers.org"
-TMP_DIR="/tmp"
+TMP_DIR="/tmp/getroot"
 DNS="1.1.1.1"
 PASSWORD="1"
 
