@@ -270,7 +270,7 @@ download_rootfs() {
     info "Extracting rootfs to ${OUTPUT}..."
     mkdir -p "$OUTPUT"
 
-    tar_opts="-xf" && [ "$VERBOSE" -eq 1 ] && tar_opts="-xvf"
+    tar_opts="-xf" && [ "${VERBOSE:-}" -eq 1 ] && tar_opts="-xvf"
     if ! tar $tar_opts "${TMP_DIR}/rootfs.tar.xz" -C "$OUTPUT"; then
         rm -rf -- "$TMP_DIR" "$OUTPUT"
         die "Failed to extract rootfs"
@@ -295,7 +295,6 @@ DISTRO=""
 RELEASE=""
 ARCH=""
 OUTPUT=""
-VERBOSE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
