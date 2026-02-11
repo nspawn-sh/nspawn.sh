@@ -89,12 +89,12 @@ VERSION="1.0.1"
 #set -x # debug flag
 set -eu
 
-# Android routing priority
+# Android routing priority offsets
 # Default: VPN > WiFi > Mobile data
-# Lower number = higher priority
-VPN_PRIO=7777
-WIFI_PRIO=8888
-MOBILE_PRIO=9999
+# Lower number = higher priority (1-3000)
+VPN_PRIO=100
+WIFI_PRIO=200
+MOBILE_PRIO=300
 
 NET_PREFIX="10.11.0"
 SUBNET="/24"
@@ -304,7 +304,7 @@ add_ipt_rule() {
 
 get_next_ip() {
     count=2
-    for ns in "$NETNS_DIR"/$BRIDGE-*; do
+    for ns in "$NETNS_DIR"/"$BRIDGE"-*; do
         [ -e "$ns" ] && count=$((count + 1))
     done
     echo "${NET_PREFIX}.${count}"
@@ -441,28 +441,28 @@ setup_android_routing() {
     ip -6 route replace "$BRIDGE_SUBNET6" dev "$BRIDGE" table local_network
 
     # Ensure hotspot clients can reach container directly
-    ip_rule_add local_network 6666
+    ip_rule_add local_network "$BRIDGE_PRIO_BASE"
 
     # VPN tunnels
     for table in $vpn; do
-        check_ip_rule "lookup $table" && ip_rule_add "$table" "$VPN_PRIO"
+        check_ip_rule "lookup $table" && ip_rule_add "$table" "$(($BRIDGE_PRIO_BASE + $VPN_PRIO))"
     done
 
     # Wifi or ethernet
     for table in wlan0 eth0; do
-        check_ip_rule "lookup $table" && ip_rule_add "$table" "$WIFI_PRIO"
+        check_ip_rule "lookup $table" && ip_rule_add "$table" "$(($BRIDGE_PRIO_BASE + $WIFI_PRIO))"
     done
 
     # Cellular
     for table in $cellular; do
         if check_ip_rule "lookup $table"; then
-            ip_rule_add "$table" "$MOBILE_PRIO"
+            ip_rule_add "$table" "$(($BRIDGE_PRIO_BASE + $MOBILE_PRIO))"
         fi
     done
 
     # The approach above is more effective, keep this here for future reference
 #    for iface in $vpn wlan0 eth0 $cellular; do
-#        if check_ip_rule "lookup $interface"; then
+#        if check_ip_rule "lookup $iface"; then
 #            ndc ipfwd remove "$BRIDGE" "$iface" >/dev/null
 #            ndc ipfwd add "$BRIDGE" "$iface" >/dev/null
 #        fi
@@ -476,24 +476,30 @@ setup_android_routing() {
 # falls through to the next rule. Free failover, zero code.
 android_custom_routing() {
     [ -z "${ROUTE_VIA:-}" ] && return 0
-
     if ! check_ip_rule "lookup $ROUTE_VIA"; then
         die "--route-via $ROUTE_VIA: no routing table found (interface down?)"
     fi
-
     ct_ip4="$1"
-    ct_ip6="${NET6_PREFIX}${ct_ip4##*.}"
 
-    prio=5000
-    octet="${ct_ip4##*.}"
-    prio=$((prio + octet))
+    if [ -n "${CT_IP6:-}" ]; then
+        ct_ip6="$CT_IP6"
+    else
+        ct_ip6="${NET6_PREFIX}${ct_ip4##*.}"
+    fi
 
-    ip rule add from "$ct_ip4" lookup "$ROUTE_VIA" priority "$prio" 2>/dev/null || true
-    ip -6 rule add from "$ct_ip6" lookup "$ROUTE_VIA" priority "$prio" 2>/dev/null || true
+    # Extract the last two octets
+    last_two="${ct_ip4#*.*.}"
+    third_octet="${last_two%%.*}"
+    fourth_octet="${last_two##*.}"
 
+    prio=$((5000 + (third_octet * 10) + fourth_octet))
+
+    ip rule del from "$ct_ip4" priority "$prio" 2>/dev/null || true
+    ip rule add from "$ct_ip4" lookup "$ROUTE_VIA" priority "$prio"
+    ip -6 rule del from "$ct_ip6" priority "$prio" 2>/dev/null || true
+    ip -6 rule add from "$ct_ip6" lookup "$ROUTE_VIA" priority "$prio"
     mkdir -p "$RT_DIR"
     echo "$prio $ct_ip4 $ct_ip6 $ROUTE_VIA" >> "$RT_DIR/custom_routes"
-
     info "Routing $ct_ip4 ($ct_ip6) via $ROUTE_VIA"
 }
 
@@ -597,8 +603,8 @@ if [ "${USE_NETNS:-}" = "1" ]; then
     fi
 
     HASH_TOOL=$(command -v md5sum || echo cksum)
-
     BRIDGE_HASH=$(printf '%s' "$BRIDGE" | $HASH_TOOL | awk '{print $1}')
+    BRIDGE_PRIO_BASE=$((6000 + 0x${BRIDGE_HASH%%????????????????????????} % 1000))
     NETNS_NAME="$BRIDGE-$(printf '%s' "$BRIDGE_HASH$ROOTFS" | $HASH_TOOL | awk '{print substr($1,1,8)}')"
     VETH_NAME="$(printf '%s' "$BRIDGE_HASH$NETNS_NAME" | $HASH_TOOL | awk '{print substr($1,1,8)}')"
 
@@ -619,8 +625,12 @@ if [ "${USE_NETNS:-}" = "1" ]; then
     [ "${ANDROID:-}" = "1" ] && setup_android_routing
 
     if [ -e "$NETNS_DIR/$NETNS_NAME" ]; then
-        CT_IP=$(ip netns exec "$NETNS_NAME" ip addr show "eth0_${VETH_NAME}" 2>/dev/null | \
-                grep -oE "${NET_PREFIX}\.[0-9]+" | head -1)
+        CT_IP=$(ip netns exec "$NETNS_NAME" ip -4 addr show "eth0_${VETH_NAME}" 2>/dev/null | \
+                awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
+
+        CT_IP6=$(ip netns exec "$NETNS_NAME" ip -6 addr show "eth0_${VETH_NAME}" 2>/dev/null | \
+                awk '/inet6 / && !/fe80/ {print $2}' | cut -d/ -f1 | head -1)
+
         [ -z "$CT_IP" ] && CT_IP=$(get_next_ip)
     else
         CT_IP=$(get_next_ip)
