@@ -371,7 +371,7 @@ setup_port_forward() {
     [ "${ANDROID:-}" = "1" ] && for ipt_cmd in iptables ip6tables; do
         "$ipt_cmd" -t nat -D PREROUTING -p tcp --dport 8022 -j RETURN 2>/dev/null || true
         "$ipt_cmd" -t nat -I PREROUTING -p tcp --dport 8022 -j RETURN
-    done
+    done || true
 }
 
 setup_bridge() {
