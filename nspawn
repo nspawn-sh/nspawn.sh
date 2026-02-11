@@ -132,16 +132,11 @@ if [ -n "${ANDROID_ROOT:-}" ] && [ -n "${ANDROID_DATA:-}" ]; then
     # Android does have iproute2 ip command
     ip() { /system/bin/ip "$@"; }
 
+    # toybox mount is missing required features
     if command -v busybox >/dev/null 2>&1; then
         mount() { busybox mount "$@"; }
     elif [ "$(command -v mount)" = "/system/bin/mount" ]; then
         die "toybox mount is not supported"
-    fi
-
-    # toybox mount is missing required features
-    if [ "$(command -v mount)" = "/system/bin/mount" ]; then
-        command -v busybox >/dev/null 2>&1 || die "toybox mount is not supported"
-        mount() { busybox mount "$@"; }
     fi
 fi
 
@@ -195,15 +190,15 @@ if [ "${PHASE2:-}" = "1" ]; then
 
     mount -t proc -o nosuid,nodev,noexec proc "$ROOTFS/proc"
     mount -t sysfs -o ro,nosuid,nodev,noexec sysfs "$ROOTFS/sys"
-    mount -t cgroup2 -o nosuid,noexec,nodev cgroup2 "$ROOTFS/sys/fs/cgroup"
+    mount -t cgroup2 -o nosuid,noexec,nodev cgroup "$ROOTFS/sys/fs/cgroup"
     mount -t tmpfs -o nosuid,nodev,noatime tmpfs "$ROOTFS/tmp"
     mount -t tmpfs -o rw,nosuid,nodev,mode=755 tmpfs "$ROOTFS/run"
-    mount -t tmpfs -o nosuid,mode=755,strictatime,size=65536k tmpfs "$ROOTFS/dev"
+    mount -t tmpfs -o noexec,mode=755,strictatime tmpfs "$ROOTFS/dev"
 
     # Minimal /dev setup; a classic bind mount of /dev is usually overkill
     mkdir -p "$ROOTFS/dev/pts" "$ROOTFS/dev/shm" "$ROOTFS/dev/net" "$ROOTFS/dev/mqueue"
     mount -t tmpfs -o nosuid,noexec,nodev,mode=1777,size=524288k shm "$ROOTFS/dev/shm"
-    mount -t mqueue -o rw,nosuid,nodev,noexec,relatime mqueue "$ROOTFS/dev/mqueue"
+    mount -t mqueue -o nosuid,nodev,noexec mqueue "$ROOTFS/dev/mqueue"
 
     mknod -m 666 "$ROOTFS/dev/null" c 1 3
     mknod -m 666 "$ROOTFS/dev/zero" c 1 5
@@ -212,7 +207,7 @@ if [ "${PHASE2:-}" = "1" ]; then
     mknod -m 666 "$ROOTFS/dev/fuse" c 10 229
     mknod -m 666 "$ROOTFS/dev/random" c 1 8
     mknod -m 666 "$ROOTFS/dev/urandom" c 1 9
-    mknod -m 620 "$ROOTFS/dev/console" c 136 0
+    mknod -m 0620 "$ROOTFS/dev/console" c 5 0
     mknod -m 666 "$ROOTFS/dev/net/tun" c 10 200
 
     ln -sf pts/ptmx "$ROOTFS/dev/ptmx"
@@ -221,7 +216,7 @@ if [ "${PHASE2:-}" = "1" ]; then
     ln -sf /proc/self/fd/1 "$ROOTFS/dev/stdout"
     ln -sf /proc/self/fd/2 "$ROOTFS/dev/stderr"
 
-#    mount -t devpts -o nosuid,noexec,newinstance,mode=620,ptmxmode=0666 devpts "$ROOTFS/dev/pts"
+#    mount -t devpts -o nosuid,noexec,newinstance,ptmxmode=0666,mode=620,gid=5 devpts "$ROOTFS/dev/pts"
     mount -o bind /dev/pts "$ROOTFS/dev/pts"
     mount -o remount,ptmxmode=0666,mode=620 "$ROOTFS/dev/pts"
 
@@ -286,6 +281,7 @@ if [ "${PHASE2:-}" = "1" ]; then
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         HOME=/root \
         TERM=xterm-256color \
+        container=nspawn \
         /bin/sh -c 'cd; umount -l /old_root && rmdir /old_root; exec "$@"' -- "$@"
 fi
 
@@ -308,7 +304,7 @@ add_ipt_rule() {
 
 get_next_ip() {
     count=2
-    for ns in "$NETNS_DIR"/*; do
+    for ns in "$NETNS_DIR"/$BRIDGE-*; do
         [ -e "$ns" ] && count=$((count + 1))
     done
     echo "${NET_PREFIX}.${count}"
@@ -659,10 +655,7 @@ if [ "${FULL_UNSHARE:-}" = 1 ]; then
 fi
 
 # Start phase 2
-export PHASE2=1
-export HOSTNAME
-export UTS_NS
-export USE_NETNS
+PHASE2=1; export PHASE2 HOSTNAME UTS_NS USE_NETNS
 if [ "${MOUNT_NS:-}" = "1" ]; then
     exec ${NETNS_ENTER:-} unshare $ARGS -- "$0" "$ROOTFS" "$@"
 else
