@@ -108,7 +108,10 @@ BRIDGE_IP6="${NET6_PREFIX}1"
 
 BRIDGE="nspawn_br1"
 PORT_RANGE=""
-WAN_IF="wlan0"
+WAN_IF=""  # Auto-detect if empty, used for port forwarding rules
+
+# These are Qualcomm Snapdragon cellular interface; I do not have MediaTek-based phone
+MOBILE_DATA_IFACE="rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4"
 
 RT_DIR="/run/nspawn"
 NETNS_DIR="/run/netns"
@@ -350,6 +353,15 @@ setup_port_forward() {
     ct_ip4="$1"
     ct_ip6="${NET6_PREFIX}${1##*.}"
 
+    if [ -z "$WAN_IF" ]; then
+        if [ "${ANDROID:-}" = "1" ]; then
+            WAN_IF=$(ip link show wlan0 >/dev/null 2>&1 && echo "wlan0" || echo "eth0")
+        else
+            WAN_IF=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5; exit}')
+        fi
+        [ -z "$WAN_IF" ] && WAN_IF="eth0"
+    fi
+
     for proto in tcp udp; do
         add_ipt_rule iptables  -t nat -I PREROUTING -i "$WAN_IF" -p "$proto" --dport "$PORT_RANGE" -j DNAT --to-destination "$ct_ip4"
         add_ipt_rule ip6tables -t nat -I PREROUTING -i "$WAN_IF" -p "$proto" --dport "$PORT_RANGE" -j DNAT --to-destination "$ct_ip6"
@@ -426,7 +438,6 @@ setup_netns() {
 # possible to have even more routing tables (e.g., tun2, tun3, tun4,...).
 # The goal of this function is to have a baseline working connectivity.
 setup_android_routing() {
-    cellular="rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4"
     vpn="tun0 tun1"
 
     ip_rule_add() {
@@ -454,14 +465,14 @@ setup_android_routing() {
     done
 
     # Cellular
-    for table in $cellular; do
+    for table in $MOBILE_DATA_IFACE; do
         if check_ip_rule "lookup $table"; then
             ip_rule_add "$table" "$(($BRIDGE_PRIO_BASE + $MOBILE_PRIO))"
         fi
     done
 
     # The approach above is more effective, keep this here for future reference
-#    for iface in $vpn wlan0 eth0 $cellular; do
+#    for iface in $vpn wlan0 eth0 $MOBILE_DATA_IFACE; do
 #        if check_ip_rule "lookup $iface"; then
 #            ndc ipfwd remove "$BRIDGE" "$iface" >/dev/null
 #            ndc ipfwd add "$BRIDGE" "$iface" >/dev/null
@@ -642,26 +653,15 @@ if [ "${USE_NETNS:-}" = "1" ]; then
     NETNS_ENTER="ip netns exec $NETNS_NAME"
 fi
 
-check_ns -p && PID_NS=1
-check_ns -i && IPC_NS=1
-check_ns -u && UTS_NS=1
-check_ns -m && MOUNT_NS=1
+check_ns -p && ARGS="${ARGS:-} -p -f" && PID_NS=1
+check_ns -i && ARGS="${ARGS:-} -i" && IPC_NS=1
+check_ns -u && ARGS="${ARGS:-} -u" && UTS_NS=1
+check_ns -m && ARGS="${ARGS:-} -m" && MOUNT_NS=1
 
 if unshare --root / true 2>/dev/null; then
-    FULL_UNSHARE=1
-    check_ns -T && TIME_NS=1
-    check_ns -C && CGROUP_NS=1
-fi
-
-[ "${PID_NS:-}" = 1 ] && ARGS="${ARGS:-} -p -f"
-[ "${IPC_NS:-}" = 1 ] && ARGS="${ARGS:-} -i"
-[ "${UTS_NS:-}" = 1 ] && ARGS="${ARGS:-} -u"
-[ "${MOUNT_NS:-}" = 1 ] && ARGS="${ARGS:-} -m"
-
-if [ "${FULL_UNSHARE:-}" = 1 ]; then
     ARGS="${ARGS:-} --kill-child"
-    [ "${TIME_NS:-}" = 1 ] && ARGS="${ARGS:-} -T"
-    [ "${CGROUP_NS:-}" = 1 ] && ARGS="${ARGS:-} -C"
+    check_ns -T && ARGS="${ARGS:-} -T" && TIME_NS=1
+    check_ns -C && ARGS="${ARGS:-} -C" && CGROUP_NS=1
 fi
 
 # Start phase 2
